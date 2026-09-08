@@ -20,4 +20,4 @@ Conventional Pi directories, shared `.agents/skills`, and common installed packa
 
 ## Publication
 
-The release candidate is prepared on `release/native-0.3.0`; the repository remains private while the owner decides whether to replace the initial commit's personal email with a GitHub no-reply address. The marketplace submission is drafted and has not been sent. Marketplace approval is a separate maintainer decision after submission and automated checks. Do not describe a submitted or validated issue as a published listing.
+Version 0.3.0 is prepared for public distribution from `main`. The README documents installation and removal, dependencies, storage, and safety boundaries. Marketplace submission follows release validation; listing requires separate maintainer approval. See the repository releases and marketplace submission for current publication status.
