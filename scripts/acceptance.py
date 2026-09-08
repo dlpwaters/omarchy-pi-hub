@@ -27,6 +27,8 @@ with tempfile.TemporaryDirectory(prefix='pi-hub-acceptance-') as directory:
     (package / 'README.md').write_text('# Acceptance fixture\nA harmless local prompt package.\n')
     (package / 'prompts/check-package.md').write_text('---\ndescription: Acceptance fixture\n---\nDescribe $1.\n')
     env = dict(os.environ, HOME=str(base), XDG_STATE_HOME=str(base / 'state'),
+               XDG_CONFIG_HOME=str(base / 'config'), XDG_DATA_HOME=str(base / 'data'),
+               XDG_CACHE_HOME=str(base / 'cache'),
                PI_CODING_AGENT_DIR=str(base / 'agent'), PI_HUB_PI=PI,
                PI_OFFLINE='1', npm_config_ignore_scripts='true')
 

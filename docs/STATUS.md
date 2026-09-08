@@ -1,30 +1,23 @@
 # Pi Hub status
 
-Native Omarchy plugin, version 0.2.0. The π bar button and bundled launcher open a Quickshell panel with Browse, Installed, Extensions, Skills, and Prompts tabs.
+Version 0.3.0 provides a native Omarchy panel with Browse, Installed, Extensions, Skills, and Prompts tabs. Repository: https://github.com/dlpwaters/omarchy-pi-hub.
 
-## Verified
+## Verification
 
-- 15 isolated backend regression tests pass.
-- Python compilation, manifest parsing, QML lint, and `omarchy plugin validate` pass.
-- `scripts/acceptance.py` passes against Pi 0.85.1 using an isolated home/project and no model prompts: generated resource loading through RPC, create/edit/stale-revision rejection/delete/restore, resource enable/disable, reviewed installation, package discovery/enable/disable/removal, scope-bound review tokens, and changed-source rejection.
-- The native panel opens and reads the user's existing resources; live npm catalog search works.
-- Native Ctrl+N, text entry, Ctrl+S, disk save, and skill selection/read were exercised in a temporary project. Native review/trust/install confirmation and removal confirmation also passed with a harmless local package.
-- Live npm static review includes the README, manifest, and prioritized source previews. Plain GitHub URL review resolves to an immutable commit before inspection.
+- Backend regression suite: 23 passing tests, including stale-edit protection, scoped review tokens, source-change rejection, safe skill deletion, manifest path containment, review limits, and Git filter handling.
+- Python compilation, manifest parsing, QML lint, and Omarchy plugin validation pass.
+- Isolated real-Pi acceptance passes on Pi 0.85.1: generated resources load through RPC without a model prompt; editor save/delete/restore and native resource toggles work; reviewed local install, package discovery, enable/disable, and removal work.
+- The native panel has been exercised on Omarchy 4.0.2, Quickshell 0.3.1, and Qt 6.11.2. Native editing and confirmed package installation/removal were tested with temporary fixtures. npm browsing and source previews were checked live.
+- The README preview is a capture of the native interface with no personal path or resource contents displayed.
 
-## Operational notes
+## Compatibility and boundaries
 
-- Existing Pi sessions need `/reload`; the panel provides a copy button. It does not inject commands into another process or call a model.
-- Project package changes use Pi's documented one-command `--approve` after the panel's explicit review/confirmation. This does not persist project trust. Global operations use `--no-approve` to avoid loading a project's configuration.
-- Npm lifecycle scripts are blocked. Packages needing setup scripts require deliberate manual setup. The reviewed archive is checked again before installation; the final Pi/npm download retains the normal registry trust boundary.
-- Reviews have bounded downloads and previews: 10 MB compressed download, 500 archive entries, 100 MB declared archive expansion, 48 KB per file preview, 500 KB total preview text, and 30-minute review tokens.
-- Local and npm packages, HTTPS GitHub URLs, GitHub branches/tags, and pinned commits are supported. Other Git hosts and SSH sources are not supported by the native reviewer.
-- Resource discovery covers conventional Pi directories, shared `.agents/skills`, and common installed package layouts. Package and shared resources are read-only. Unusual resource layouts configured with custom globs may need Pi's own configuration tools.
-- File/config backups, review tokens, private locks, and recoverable trash live under `$XDG_STATE_HOME/pi-hub` (default `~/.local/state/pi-hub`). UI scope/folder preferences live in `~/.config/omarchy/pi-hub.ini`.
-- Unsaved editor drafts survive panel close/open, but not a shell restart. File revision checks reject overwriting an external edit.
-- The old standalone Pi Hub extension is preserved and is no longer required by this plugin.
+Python 3.11+ is required. A second physical Omarchy machine and older Omarchy/Pi versions have not been tested. GitHub Actions checks the portable backend; it does not exercise a compositor.
 
-## Handoff
+Existing Pi sessions need `/reload`. Project package changes use one-command Pi approval after the panel's explicit confirmation. npm lifecycle scripts are blocked; dependencies and final Pi/npm downloads retain their normal trust boundaries. Review cannot establish that a third-party package is safe.
 
-Repository: https://github.com/dlpwaters/omarchy-pi-hub (private). Initial development branch: `main`.
+Conventional Pi directories, shared `.agents/skills`, and common installed package layouts are supported. Unusual custom resource globs may need Pi's own configuration tools. Other Git hosts, SSH sources, Git checkout filters, and oversized local reviews are unsupported. See README and SECURITY.md for all dependencies, storage locations, and limits.
 
-Next release step: user acceptance on normal day-to-day packages and a second Omarchy installation, then prepare a public release and marketplace submission with explicit publication approval. No marketplace submission or public release has been made.
+## Publication
+
+The release candidate is prepared on `release/native-0.3.0`; the repository remains private while the owner decides whether to replace the initial commit's personal email with a GitHub no-reply address. The marketplace submission is drafted and has not been sent. Marketplace approval is a separate maintainer decision after submission and automated checks. Do not describe a submitted or validated issue as a published listing.

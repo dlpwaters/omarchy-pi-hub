@@ -27,7 +27,7 @@ import tempfile
 import time
 from typing import Any, Callable, Iterable
 from urllib.parse import quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 RESOURCE_KINDS = ("extensions", "skills", "prompts")
@@ -50,6 +50,17 @@ class HubError(Exception):
     pass
 
 
+class HttpsRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlparse(newurl).scheme != "https":
+            raise HubError("Refusing a package download redirect outside HTTPS")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def urlopen(request, timeout):
+    return build_opener(HttpsRedirectHandler()).open(request, timeout=timeout)
+
+
 def _home() -> Path:
     return Path(os.environ.get("HOME", str(Path.home()))).expanduser().resolve()
 
@@ -62,7 +73,9 @@ def _global_agent_dir() -> Path:
 
 def _state_file() -> Path:
     base = Path(os.environ.get("XDG_STATE_HOME", str(_home() / ".local" / "state"))).expanduser()
-    return (base / "pi-hub" / "state.json").resolve()
+    path = Path(os.path.abspath(base / "pi-hub" / "state.json"))
+    _assert_no_symlink(path, path.parent)
+    return path
 
 
 def _scope(request: dict[str, Any]) -> dict[str, Any]:
@@ -120,8 +133,10 @@ def _assert_no_symlink(path: Path, root: Path) -> None:
 @contextlib.contextmanager
 def _file_lock(target: Path):
     lock_dir = _state_file().parent / "locks"
+    _assert_no_symlink(lock_dir, lock_dir.parent)
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock = lock_dir / (hashlib.sha256(str(target.absolute()).encode()).hexdigest() + ".lock")
+    _assert_no_symlink(lock, lock_dir)
     with lock.open("a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
@@ -129,6 +144,7 @@ def _file_lock(target: Path):
 
 
 def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    _assert_no_symlink(path, path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -158,6 +174,7 @@ def _json_update(path: Path, change: Callable[[dict[str, Any]], Any], backup_dir
                 raise HubError(f"Expected a JSON object in {path}")
             result = change(value)
             if backup_dir is not None and path.exists():
+                _assert_no_symlink(backup_dir, backup_dir)
                 backup_dir.mkdir(parents=True, exist_ok=True)
                 backup = backup_dir / f"{int(time.time() * 1000)}-{secrets.token_hex(3)}-{path.name}"
                 shutil.copy2(path, backup, follow_symlinks=False)
@@ -181,7 +198,8 @@ def _settings_update(scope: dict[str, Any], change: Callable[[dict[str, Any]], A
 
 def _read_text(path: Path) -> str:
     try:
-        data = path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(MAX_FILE + 1)
     except OSError as exc:
         raise HubError(f"Cannot read {path}: {exc}") from exc
     if len(data) > MAX_FILE:
@@ -432,7 +450,11 @@ def _manifest_paths(root: Path, manifest: dict[str, Any], kind: str) -> list[Pat
         for rule in rules:
             if not isinstance(rule, str) or rule.startswith(("!", "+", "-")):
                 continue
+            if Path(rule).is_absolute() or ".." in Path(rule).parts:
+                continue
             candidate = root / rule
+            if not candidate.resolve().is_relative_to(root.resolve()):
+                continue
             if not any(c in rule for c in "*?[") and candidate.is_file() and not candidate.is_symlink():
                 result.append(candidate)
             else:
@@ -619,19 +641,19 @@ def _fetch_bytes(url: str, timeout: int = 12) -> bytes:
 def _verify_archive(data: bytes, dist: dict[str, Any]) -> None:
     integrity = dist.get("integrity")
     if isinstance(integrity, str):
-        for candidate in integrity.split():
-            if "-" not in candidate:
-                continue
-            algorithm, encoded = candidate.split("-", 1)
-            if algorithm not in hashlib.algorithms_available:
-                continue
-            actual = base64.b64encode(hashlib.new(algorithm, data).digest()).decode()
-            if not secrets.compare_digest(actual.rstrip("="), encoded.rstrip("=")):
-                raise HubError("Package archive integrity check failed")
-            return
+        for algorithm in ("sha512", "sha384", "sha256", "sha1"):
+            candidates = [c.split("-", 1)[1] for c in integrity.split() if c.startswith(algorithm + "-")]
+            if candidates:
+                actual = base64.b64encode(hashlib.new(algorithm, data).digest()).decode()
+                if not any(secrets.compare_digest(actual.rstrip("="), value.rstrip("=")) for value in candidates):
+                    raise HubError("Package archive integrity check failed")
+                return
     shasum = dist.get("shasum")
-    if isinstance(shasum, str) and not secrets.compare_digest(hashlib.sha1(data).hexdigest(), shasum.lower()):
-        raise HubError("Package archive checksum check failed")
+    if isinstance(shasum, str) and re.fullmatch(r"[0-9a-fA-F]{40}", shasum):
+        if not secrets.compare_digest(hashlib.sha1(data).hexdigest(), shasum.lower()):
+            raise HubError("Package archive checksum check failed")
+        return
+    raise HubError("Package metadata has no supported archive checksum")
 
 
 def _text_preview(data: bytes, remaining: int) -> str:
@@ -716,38 +738,49 @@ def _inspect_tarball(data: bytes) -> tuple[list[str], dict[str, str], list[str]]
     return sorted(files), contents, warnings
 
 
-def _walk_static(root: Path) -> tuple[list[str], dict[str, str], list[str]]:
+def _walk_static(root: Path, strict: bool = False) -> tuple[list[str], dict[str, str], list[str]]:
     files: list[str] = []
     contents: dict[str, str] = {}
     warnings: list[str] = []
     total_text = 0
     candidates: list[tuple[str, Path]] = []
     for current, dirs, names in os.walk(root, followlinks=False):
+        if strict and any((Path(current) / d).is_symlink() for d in dirs if d not in (".git", "node_modules")):
+            raise HubError("Local package contains a symlinked directory; review a regular-file copy")
         dirs[:] = sorted(d for d in dirs if d not in (".git", "node_modules") and not (Path(current) / d).is_symlink())
         for filename in sorted(names):
             path = Path(current) / filename
             rel = path.relative_to(root).as_posix()
             if path.is_symlink():
+                if strict:
+                    raise HubError("Local package contains a symlink; review a regular-file copy")
                 warnings.append(f"Link omitted from preview: {rel}")
                 continue
-            files.append(rel)
+            if not path.is_file():
+                if strict:
+                    raise HubError("Local package contains a non-regular file")
+                continue
             if len(files) >= MAX_REVIEW_FILES:
+                if strict:
+                    raise HubError("Local package exceeds the 500-file review limit")
                 warnings.append("Package has more than 500 files; the file list was truncated.")
                 break
+            files.append(rel)
             if not _previewable(rel):
                 continue
             if path.stat().st_size > MAX_FILE:
                 warnings.append(f"Large file omitted from preview: {rel}")
                 continue
             candidates.append((rel, path))
-        if len(files) >= MAX_REVIEW_FILES:
+        if not strict and len(files) >= MAX_REVIEW_FILES:
             break
     for rel, path in sorted(candidates, key=lambda item: _preview_priority(item[0])):
         if total_text >= MAX_REVIEW_TEXT:
             warnings.append("Some text files have no preview because the 500 KB review limit was reached.")
             break
         try:
-            raw = path.read_bytes()
+            with path.open("rb") as handle:
+                raw = handle.read(MAX_FILE + 1)
         except OSError:
             continue
         preview = _text_preview(raw, MAX_REVIEW_TEXT - total_text)
@@ -843,25 +876,30 @@ def _review_local(source: str, scope: dict[str, Any]) -> dict[str, Any]:
     path = Path(source).expanduser()
     if not path.is_absolute():
         path = scope["project"] / path
+    if path.is_symlink():
+        raise HubError("Refusing to review a symlinked package")
     path = path.resolve()
     if not path.exists():
         raise HubError("Local package does not exist")
-    if path.is_symlink():
-        raise HubError("Refusing to review a symlinked package")
     if path.is_file():
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_FILE + 1)
         if len(raw) > MAX_FILE:
             raise HubError("Local extension is too large to review")
         contents = {path.name: _text_preview(raw, MAX_REVIEW_TEXT)}
         return _review_payload(str(path), path.stem, "local", [path.name], contents, [], hashlib.sha256(raw).hexdigest())
-    files, contents, warnings = _walk_static(path)
+    files, contents, warnings = _walk_static(path, strict=True)
     artifact_hash = hashlib.sha256()
+    total_bytes = 0
     for relative in files:
         candidate = path / relative
         if candidate.is_file() and not candidate.is_symlink():
             artifact_hash.update(relative.encode("utf-8") + b"\0")
             with candidate.open("rb") as handle:
                 while chunk := handle.read(1024 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_ARCHIVE_UNCOMPRESSED:
+                        raise HubError("Local package exceeds the 100 MB review limit")
                     artifact_hash.update(chunk)
     manifest: dict[str, Any] = {}
     with contextlib.suppress(json.JSONDecodeError):
@@ -900,8 +938,12 @@ def _parse_github(source: str) -> tuple[str, str]:
     return url, commit.lower() if GIT_COMMIT_RE.fullmatch(commit) else commit
 
 
-def _run(argv: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+def _run(argv: list[str], cwd: Path, timeout: int, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    if argv[0] == "git":
+        # A repository's attributes must not activate the user's checkout filters.
+        env = {key: value for key, value in env.items() if not key.startswith("GIT_")}
+        env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_ATTR_NOSYSTEM": "1"})
     env.update({
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=5",
@@ -909,7 +951,7 @@ def _run(argv: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProces
         "NPM_CONFIG_IGNORE_SCRIPTS": "true",
     })
     try:
-        return subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout, check=False)
+        return subprocess.run(argv, cwd=cwd, env=env, text=True, input=input_text, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise HubError(f"Command timed out after {timeout} seconds") from exc
     except OSError as exc:
@@ -942,6 +984,13 @@ def _review_github(source: str) -> dict[str, Any]:
         actual = _run(["git", "rev-parse", "HEAD"], root, 5)
         if actual.returncode or actual.stdout.strip().lower() != commit:
             raise HubError("Fetched GitHub content did not match the pinned commit")
+        tracked = _run(["git", "ls-files", "-z"], root, 5)
+        attributes = _run(["git", "check-attr", "--cached", "-z", "--stdin", "filter"], root, 5, input_text=tracked.stdout)
+        if tracked.returncode or attributes.returncode:
+            raise HubError("Could not verify GitHub checkout attributes")
+        values = attributes.stdout.split("\0")
+        if any(value not in ("unspecified", "unset") for value in values[2::3]):
+            raise HubError("Git checkout filters (including LFS) are unsupported: installed content may differ from review")
         files, contents, warnings = _walk_static(root)
         manifest: dict[str, Any] = {}
         with contextlib.suppress(json.JSONDecodeError):
@@ -1250,8 +1299,9 @@ def _backup(path: Path, scope: dict[str, Any]) -> None:
     if not path.exists():
         return
     backup_dir = _state_file().parent / "backups" / hashlib.sha256(scope["key"].encode()).hexdigest()[:12]
+    _assert_no_symlink(backup_dir, _state_file().parent)
     backup_dir.mkdir(parents=True, exist_ok=True)
-    destination = backup_dir / f"{int(time.time() * 1000)}-{path.name}"
+    destination = backup_dir / f"{int(time.time() * 1000)}-{secrets.token_hex(6)}-{path.name}"
     shutil.copy2(path, destination, follow_symlinks=False)
 
 
@@ -1323,10 +1373,11 @@ def action_delete(request: dict[str, Any], scope: dict[str, Any]) -> dict[str, A
     current = _read_text(path)
     if not secrets.compare_digest(_revision(current), expected):
         raise HubError("Resource changed since it was opened; reload before deleting")
-    target = path.parent if item["kind"] == "skills" and path.name == "SKILL.md" else path
+    target = path.parent if item["kind"] == "skills" and path.name == "SKILL.md" and path.parent != root else path
     _assert_no_symlink(target, root)
     token = secrets.token_urlsafe(24)
     trash_root = _state_file().parent / "trash" / token
+    _assert_no_symlink(trash_root, _state_file().parent)
     trash_root.mkdir(parents=True, exist_ok=False)
     trashed = trash_root / target.name
     shutil.move(str(target), str(trashed))
@@ -1351,6 +1402,7 @@ def action_restore(request: dict[str, Any], scope: dict[str, Any]) -> dict[str, 
         raise HubError("Restore token is invalid for this scope")
     original = Path(record.get("original", ""))
     trashed = Path(record.get("trashed", ""))
+    _assert_no_symlink(trashed, _state_file().parent / "trash")
     if not trashed.exists():
         raise HubError("Trashed resource is no longer available")
     if original.exists():

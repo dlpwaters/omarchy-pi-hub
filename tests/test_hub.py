@@ -106,6 +106,48 @@ class HubTest(unittest.TestCase):
         with self.assertRaisesRegex(hub.HubError, "outside"):
             hub.handle(self.request("save", kind="skills", name="shared", path=str(skill), body=opened["body"], revision=opened["revision"]))
 
+    def test_deleting_root_skill_preserves_sibling_skills(self):
+        root = self.agent / "skills"
+        sibling = root / "sibling" / "SKILL.md"
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text("---\nname: sibling\ndescription: Keep me\n---\n")
+        skill = root / "SKILL.md"
+        skill.write_text("---\nname: root-skill\ndescription: Root skill\n---\n")
+        opened = hub.handle(self.request("read", path=str(skill)))["resource"]
+        deleted = hub.handle(self.request("delete", path=str(skill), revision=opened["revision"], confirm=True))
+        self.assertFalse(skill.exists())
+        self.assertTrue(sibling.is_file())
+        hub.handle(self.request("restore", token=deleted["undoToken"]))
+        self.assertEqual(skill.read_text(), opened["body"])
+        self.assertTrue(sibling.is_file())
+
+    def test_local_review_rejects_truncated_file_set_and_links(self):
+        package = self.base / "large-package"
+        package.mkdir()
+        for index in range(hub.MAX_REVIEW_FILES):
+            (package / f"{index:04}.txt").write_text("content")
+        hub.handle(self.request("review", source=str(package)))
+        (package / "overflow.txt").write_text("unreviewed")
+        with self.assertRaisesRegex(hub.HubError, "500-file"):
+            hub.handle(self.request("review", source=str(package)))
+        (package / "overflow.txt").unlink()
+        (package / "linked").symlink_to(self.project, target_is_directory=True)
+        with self.assertRaisesRegex(hub.HubError, "symlinked directory"):
+            hub.handle(self.request("review", source=str(package)))
+
+    def test_manifest_paths_cannot_escape_package_or_break_listing(self):
+        package = self.base / "manifest-package"
+        package.mkdir()
+        outside = self.base / "outside.md"
+        outside.write_text("Private outside content")
+        (package / "linked").symlink_to(self.base, target_is_directory=True)
+        (package / "safe.md").write_text("Safe prompt")
+        manifest = {"pi": {"prompts": [str(outside), "../outside.md", "../*.md", "linked/outside.md", "safe.md"]}}
+        (package / "package.json").write_text(json.dumps(manifest))
+        self.write_settings({"packages": [str(package)]})
+        listing = hub.handle(self.request("list"))
+        self.assertEqual([r["name"] for r in listing["resources"]], ["safe"])
+
     def test_symlinked_project_settings_are_never_written(self):
         target = self.base / "outside"
         target.mkdir()
@@ -114,6 +156,20 @@ class HubTest(unittest.TestCase):
         with self.assertRaisesRegex(hub.HubError, "symlink"):
             hub.handle(self.request("toggle", scope="project", source="npm:demo@1.0.0", enabled=False))
         self.assertEqual(json.loads((target / "settings.json").read_text())["packages"], ["npm:demo@1.0.0"])
+
+    def test_state_symlink_cannot_overwrite_another_file(self):
+        outside = self.base / "unrelated.json"
+        outside.write_text('{"keep": true}')
+        state = self.home / "state" / "pi-hub" / "state.json"
+        state.parent.mkdir(parents=True)
+        state.symlink_to(outside)
+        with self.assertRaisesRegex(hub.HubError, "symlink"):
+            hub._state_update(lambda value: value.update({"reviews": {}}))
+        self.assertEqual(outside.read_text(), '{"keep": true}')
+
+    def test_download_redirect_cannot_downgrade_https(self):
+        with self.assertRaisesRegex(hub.HubError, "HTTPS"):
+            hub.HttpsRedirectHandler().redirect_request(None, None, 302, "Found", {}, "http://example.test/archive.tgz")
 
     def test_package_toggle_preserves_config_and_restores_original_entry(self):
         original = {
@@ -229,6 +285,24 @@ class HubTest(unittest.TestCase):
         self.assertIn("size=30", opened.call_args.args[0])
         self.assertEqual(result["offset"], 30)
 
+    def test_archive_checksum_is_required_and_strongest_is_enforced(self):
+        data = b"package archive"
+        sha1 = hashlib.sha1(data).hexdigest()
+        hub._verify_archive(data, {"shasum": sha1})
+        for metadata in ({}, {"integrity": "unknown-anything"}, {"shasum": ""},
+                         {"integrity": "sha512-invalid", "shasum": sha1}):
+            with self.subTest(metadata=metadata), self.assertRaises(hub.HubError):
+                hub._verify_archive(data, metadata)
+
+    def test_large_resource_reads_are_bounded(self):
+        path = self.base / "large.ts"
+        with path.open("wb") as handle:
+            handle.truncate(hub.MAX_FILE * 100)
+        with self.assertRaisesRegex(hub.HubError, "too large"):
+            hub._read_text(path)
+        with self.assertRaisesRegex(hub.HubError, "too large"):
+            hub.handle(self.request("review", source=str(path)))
+
     def test_manifest_exact_files_and_exclusions(self):
         package = self.base / "manifest-package"
         (package / "extensions").mkdir(parents=True)
@@ -242,7 +316,7 @@ class HubTest(unittest.TestCase):
     def test_github_url_resolves_to_commit_and_previews_extensionless_readme(self):
         commit = "a" * 40
         commands = []
-        def run(argv, cwd, timeout):
+        def run(argv, cwd, timeout, input_text=None):
             commands.append(argv)
             if "ls-remote" in argv:
                 return subprocess.CompletedProcess(argv, 0, commit + "\tHEAD\n", "")
@@ -257,6 +331,28 @@ class HubTest(unittest.TestCase):
         self.assertEqual(hub._parse_github("git:github.com/example/demo@Release/V1")[1], "Release/V1")
         with self.assertRaises(hub.HubError):
             hub._parse_github("https://github.com/example/demo@--upload-pack=bad")
+
+    def test_git_review_ignores_user_filters_and_rejects_filtered_sources(self):
+        config = self.home / ".gitconfig"
+        config.write_text('[filter "demo"]\n\tsmudge = must-not-run\n')
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "filter.demo.smudge", "GIT_CONFIG_VALUE_0": "also-must-not-run"}):
+            result = hub._run(["git", "config", "--get", "filter.demo.smudge"], self.project, 5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        commit = "b" * 40
+        def run(argv, cwd, timeout, input_text=None):
+            output = ""
+            if "rev-parse" in argv:
+                output = commit + "\n"
+            elif "ls-files" in argv:
+                output = "extensions/index.ts\0"
+            elif "check-attr" in argv:
+                self.assertEqual(input_text, "extensions/index.ts\0")
+                output = "extensions/index.ts\0filter\0lfs\0"
+            return subprocess.CompletedProcess(argv, 0, output, "")
+        with mock.patch.object(hub, "_run", side_effect=run):
+            with self.assertRaisesRegex(hub.HubError, "checkout filters"):
+                hub.handle(self.request("review", source="https://github.com/example/demo@" + commit))
 
     def test_extension_listing_uses_entrypoints_and_external_file_packages(self):
         root = self.agent / "extensions" / "demo"

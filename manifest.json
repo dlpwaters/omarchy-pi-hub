@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.dlpwaters.pi-hub",
   "name": "Pi Hub",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "DLP Waters",
   "license": "MIT",
   "description": "Native Pi package browsing, source review, installation, and extension, skill, and prompt editors.",

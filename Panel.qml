@@ -73,6 +73,10 @@ Panel {
   function close() { controller.hide() }
   function toggle() { opened ? close() : open() }
   function tell(text, failed) { message = text; error = failed === true }
+  function displayPath(path) {
+    var home = Quickshell.env("HOME")
+    return home && (path === home || path.indexOf(home + "/") === 0) ? "~" + path.slice(home.length) : path
+  }
   function navigate(callback) {
     if (busy) return
     if (dirty) { pendingNavigation = callback; confirmation = null; return }
@@ -286,7 +290,7 @@ Panel {
         }
         Label {
           Layout.fillWidth: true
-          text: root.scopePath || (root.scope === "project" ? "Choose the project folder before making changes." : "Loading Pi settings…")
+          text: root.displayPath(root.scopePath) || (root.scope === "project" ? "Choose the project folder before making changes." : "Loading Pi settings…")
           color: root.muted; font.pixelSize: Style.font.caption; elide: Text.ElideMiddle; wrapMode: Text.NoWrap
         }
         RowLayout {

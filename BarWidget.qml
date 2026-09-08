@@ -8,6 +8,8 @@ BarWidget {
   moduleName: "io.github.dlpwaters.pi-hub"
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
+  readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
+  readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
   function injectPanel() {
     if (!panelLoader.item) return
     panelLoader.item.bar = root.bar
@@ -18,6 +20,7 @@ BarWidget {
   function open() { if (panelLoader.item) panelLoader.item.open() }
   function close() { if (panelLoader.item) panelLoader.item.close() }
   function toggle() { if (panelLoader.item) panelLoader.item.toggle() }
+  function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
   Loader {
