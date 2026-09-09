@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import ctypes
 import fcntl
 import fnmatch
+import gzip
 import hashlib
 import io
 import json
@@ -19,7 +21,9 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -43,6 +47,8 @@ MAX_REVIEW_TEXT = 500_000
 MAX_PREVIEW_FILE = 48_000
 MAX_REVIEW_FILES = 500
 MAX_ARCHIVE_UNCOMPRESSED = 100_000_000
+MAX_COMMAND_OUTPUT = 1_000_000
+GITHUB_REVIEW_TIMEOUT = 45
 REVIEW_TTL = 30 * 60
 
 
@@ -938,9 +944,37 @@ def _parse_github(source: str) -> tuple[str, str]:
     return url, commit.lower() if GIT_COMMIT_RE.fullmatch(commit) else commit
 
 
+def _child_pids() -> set[int]:
+    return {int(pid) for pid in Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()}
+
+
+def _cleanup_command(process: subprocess.Popen, existing_children: set[int]) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2
+    while True:
+        # Killing parents adopts their children through the subreaper, including
+        # descendants that created a new session. Never touch preexisting children.
+        children = _child_pids() - existing_children
+        for pid in children:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            if pid == process.pid:
+                process.poll()
+            else:
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+        if not (_child_pids() - existing_children):
+            process.poll()
+            return
+        if time.monotonic() >= deadline:
+            raise HubError("Helper cleanup did not finish within 2 seconds")
+        time.sleep(0.01)
+
+
 def _run(argv: list[str], cwd: Path, timeout: int, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    if argv[0] == "git":
+    if Path(argv[0]).name == "git":
         # A repository's attributes must not activate the user's checkout filters.
         env = {key: value for key, value in env.items() if not key.startswith("GIT_")}
         env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_ATTR_NOSYSTEM": "1"})
@@ -950,48 +984,243 @@ def _run(argv: list[str], cwd: Path, timeout: int, input_text: str | None = None
         "npm_config_ignore_scripts": "true",
         "NPM_CONFIG_IGNORE_SCRIPTS": "true",
     })
+    # The backend is a single-request Linux process. Adopt orphaned grandchildren
+    # so cleanup can reap the whole command group, including npm/git helpers.
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    if libc.prctl(37, ctypes.byref(previous), 0, 0, 0) or libc.prctl(36, 1, 0, 0, 0):
+        raise HubError("Could not enable helper process cleanup")
+    process = None
+    existing_children = _child_pids()
     try:
-        return subprocess.run(argv, cwd=cwd, env=env, text=True, input=input_text, capture_output=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as exc:
-        raise HubError(f"Command timed out after {timeout} seconds") from exc
+        process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        output = {"stdout": bytearray(), "stderr": bytearray()}
+        pending = memoryview(input_text.encode() if input_text is not None else b"")
+        deadline = time.monotonic() + timeout
+        total = 0
+        with selectors.DefaultSelector() as selector:
+            for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            if process.stdin is not None:
+                if pending:
+                    os.set_blocking(process.stdin.fileno(), False)
+                    selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+                else:
+                    process.stdin.close()
+            while selector.get_map() or process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HubError(f"Command timed out after {timeout} seconds")
+                for key, _ in selector.select(min(remaining, 0.1)):
+                    if key.data == "stdin":
+                        try:
+                            pending = pending[os.write(key.fd, pending[:65536]):]
+                        except BrokenPipeError:
+                            pending = pending[:0]
+                        if not pending:
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                        continue
+                    chunk = os.read(key.fd, min(65536, MAX_COMMAND_OUTPUT - total + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    total += len(chunk)
+                    if total > MAX_COMMAND_OUTPUT:
+                        raise HubError("Command output exceeds the 1 MB limit")
+                    output[key.data].extend(chunk)
+        return subprocess.CompletedProcess(argv, process.wait(), output["stdout"].decode(errors="replace"), output["stderr"].decode(errors="replace"))
     except OSError as exc:
         raise HubError(f"Could not run {argv[0]}: {exc}") from exc
+    finally:
+        try:
+            if process is not None:
+                _cleanup_command(process, existing_children)
+        finally:
+            if process is not None:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+            libc.prctl(36, previous.value, 0, 0, 0)
+
+
+class _LimitedReader:
+    """Cap bytes before a consumer (including tar's PAX parser) allocates them."""
+
+    def __init__(self, stream, limit: int, label: str):
+        self.stream, self.remaining, self.label = stream, limit, label
+
+    def read(self, size: int = -1) -> bytes:
+        size = self.remaining + 1 if size < 0 else min(size, self.remaining + 1)
+        data = self.stream.read(size)
+        self.remaining -= len(data)
+        if self.remaining < 0:
+            raise HubError(f"GitHub review exceeds the {self.label} limit")
+        return data
+
+
+@contextlib.contextmanager
+def _github_deadline():
+    # SIGALRM also interrupts blocked DNS/TLS/reads; per-socket timeouts alone
+    # permit an endless slow response. This backend runs on the main thread.
+    def expired(_signum, _frame):
+        raise HubError(f"GitHub review timed out after {GITHUB_REVIEW_TIMEOUT} seconds")
+    previous = signal.signal(signal.SIGALRM, expired)
+    timer = signal.setitimer(signal.ITIMER_REAL, GITHUB_REVIEW_TIMEOUT)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *timer)
+        signal.signal(signal.SIGALRM, previous)
+
+
+class _GithubDownload:
+    def __init__(self):
+        self.remaining = MAX_ARCHIVE
+
+    def fetch(self, url: str, accept: str = "application/vnd.github+json") -> bytes:
+        request = Request(url, headers={"User-Agent": "omarchy-pi-hub/0.3.1", "Accept": accept,
+                                        "X-GitHub-Api-Version": "2022-11-28"})
+        try:
+            with urlopen(request, timeout=8) as response:
+                reader = _LimitedReader(response, self.remaining, "10 MB remote response")
+                data = bytearray()
+                while chunk := reader.read(65536):
+                    data.extend(chunk)
+                self.remaining = reader.remaining
+                return bytes(data)
+        except HubError:
+            raise
+        except OSError as exc:
+            raise HubError(f"GitHub download failed (public repositories only; API rate limits apply): {exc}") from exc
+
+    def json(self, url: str) -> dict[str, Any]:
+        try:
+            value = json.loads(self.fetch(url))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HubError("GitHub returned invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise HubError("GitHub returned an unexpected response")
+        return value
+
+
+def _github_tree(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    entries = value.get("tree")
+    if value.get("truncated") is not False or not isinstance(entries, list) or len(entries) > MAX_REVIEW_FILES:
+        raise HubError("GitHub tree is incomplete or exceeds the 500-entry review limit")
+    files = {}
+    seen = set()
+    total = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise HubError("Invalid GitHub tree entry")
+        name = entry.get("path")
+        if (not isinstance(name, str) or not name or len(name) > 4096 or "\0" in name
+                or any(part in ("", ".", "..", ".git") for part in name.split("/")) or name in seen):
+            raise HubError("Unsafe or duplicate GitHub tree path")
+        seen.add(name)
+        if entry.get("type") == "tree" and entry.get("mode") == "040000":
+            continue
+        size = entry.get("size")
+        if entry.get("type") != "blob" or entry.get("mode") not in ("100644", "100755"):
+            raise HubError("GitHub links, submodules, and non-regular files are unsupported")
+        if type(size) is not int or size < 0 or not isinstance(entry.get("sha"), str) or not GIT_COMMIT_RE.fullmatch(entry["sha"]):
+            raise HubError("Invalid GitHub blob metadata")
+        total += size
+        if total > MAX_ARCHIVE_UNCOMPRESSED:
+            raise HubError("GitHub tree exceeds the 100 MB review limit")
+        if Path(name).name == ".gitattributes" and size > MAX_PREVIEW_FILE:
+            raise HubError("GitHub attributes are too large to check for checkout filters")
+        files[name] = entry
+    return files
+
+
+def _inspect_github_archive(data: bytes, files: dict[str, dict[str, Any]]) -> tuple[list[str], dict[str, str], list[str]]:
+    contents, warnings, previews = {}, [], {}
+    seen = set()
+    members = set()
+    prefix = None
+    # Bound the decompressed stream itself, including metadata and padding.
+    with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+        limited = _LimitedReader(compressed, MAX_ARCHIVE_UNCOMPRESSED, "100 MB expanded archive")
+        with tarfile.open(fileobj=limited, mode="r|") as archive:
+            for member in archive:
+                if len(members) >= MAX_REVIEW_FILES + 1:
+                    raise HubError("GitHub archive exceeds the 500-entry review limit")
+                parts = member.name.rstrip("/").split("/")
+                if any(part in ("", ".", "..", ".git") or "\0" in part for part in parts) or len(member.name) > 4096:
+                    raise HubError("Unsafe GitHub archive path")
+                if prefix is None:
+                    prefix = parts[0]
+                if parts[0] != prefix or member.name in members:
+                    raise HubError("Duplicate or inconsistent GitHub archive path")
+                members.add(member.name)
+                name = "/".join(parts[1:])
+                if member.isdir():
+                    continue
+                expected = files.get(name)
+                if not member.isfile() or member.sparse is not None or expected is None or member.size != expected["size"] or name in seen:
+                    raise HubError("GitHub archive does not match the pinned tree")
+                seen.add(name)
+                digest = hashlib.sha1(f"blob {member.size}\0".encode())
+                preview = bytearray()
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise HubError("GitHub archive file is unreadable")
+                with stream:
+                    while chunk := stream.read(65536):
+                        digest.update(chunk)
+                        preview.extend(chunk[:max(0, MAX_PREVIEW_FILE - len(preview))])
+                if digest.hexdigest() != expected["sha"].lower():
+                    raise HubError("GitHub archive content differs from the pinned tree (export transforms or LFS are unsupported)")
+                if Path(name).name == ".gitattributes" and b"filter" in preview:
+                    raise HubError("Git checkout filters (including LFS) are unsupported: installed content may differ from review")
+                if _previewable(name):
+                    if member.size > MAX_FILE:
+                        warnings.append(f"Large file omitted from preview: {name}")
+                    else:
+                        previews[name] = bytes(preview)
+            # tarfile accepts physical EOF without end blocks. Require both
+            # blocks and drain its buffered stream to check padding and gzip CRC.
+            if archive.fileobj.tell() != archive.offset + 512 or archive.fileobj.read(512) != b"\0" * 512:
+                raise HubError("GitHub archive has no complete tar end marker")
+            while chunk := archive.fileobj.read(65536):
+                if chunk.strip(b"\0"):
+                    raise HubError("GitHub archive has unexpected trailing data")
+    if seen != set(files):
+        raise HubError("GitHub archive omits pinned files (export-ignore is unsupported)")
+    remaining = MAX_REVIEW_TEXT
+    for name in sorted(previews, key=_preview_priority):
+        if remaining <= 0:
+            warnings.append("Some text files have no preview because the 500 KB review limit was reached.")
+            break
+        contents[name] = _text_preview(previews[name], remaining)
+        remaining -= len(contents[name])
+        if files[name]["size"] > MAX_PREVIEW_FILE:
+            warnings.append(f"Preview truncated to 48 KB: {name}")
+    return sorted(files), contents, warnings
 
 
 def _review_github(source: str) -> dict[str, Any]:
     url, commit = _parse_github(source)
-    with tempfile.TemporaryDirectory(prefix="pi-hub-review-") as temporary:
-        root = Path(temporary)
+    repository = urlparse(url).path.strip("/").removesuffix(".git")
+    api = f"https://api.github.com/repos/{repository}"
+    with _github_deadline():
+        download = _GithubDownload()
         if not GIT_COMMIT_RE.fullmatch(commit):
-            refs = [commit, f"refs/heads/{commit}", f"refs/tags/{commit}", f"refs/tags/{commit}^{{}}"]
-            resolved = _run(["git", "ls-remote", "--exit-code", "--", url, *refs], root, 30)
-            candidates = [line.split() for line in resolved.stdout.splitlines()]
-            candidates = [row for row in candidates if len(row) == 2 and GIT_COMMIT_RE.fullmatch(row[0])]
-            if resolved.returncode or not candidates:
+            resolved = download.fetch(f"{api}/commits/{quote(commit, safe='')}", "application/vnd.github.sha").decode("ascii").strip()
+            if not GIT_COMMIT_RE.fullmatch(resolved):
                 raise HubError("Could not resolve that GitHub branch or tag. Check the URL and repository access.")
-            # Prefer the commit behind an annotated tag over its tag object.
-            candidates.sort(key=lambda row: not row[1].endswith("^{}"))
-            commit = candidates[0][0].lower()
-        init = _run(["git", "-c", "core.hooksPath=/dev/null", "init", "--quiet"], root, 10)
-        if init.returncode:
-            raise HubError(init.stderr.strip() or "Could not initialize static review checkout")
-        fetched = _run(["git", "-c", "core.hooksPath=/dev/null", "fetch", "--quiet", "--depth", "1", url, commit], root, 45)
-        if fetched.returncode:
-            raise HubError(fetched.stderr.strip() or "Could not fetch pinned GitHub commit")
-        checked = _run(["git", "-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", "FETCH_HEAD"], root, 15)
-        if checked.returncode:
-            raise HubError(checked.stderr.strip() or "Could not inspect pinned GitHub commit")
-        actual = _run(["git", "rev-parse", "HEAD"], root, 5)
-        if actual.returncode or actual.stdout.strip().lower() != commit:
-            raise HubError("Fetched GitHub content did not match the pinned commit")
-        tracked = _run(["git", "ls-files", "-z"], root, 5)
-        attributes = _run(["git", "check-attr", "--cached", "-z", "--stdin", "filter"], root, 5, input_text=tracked.stdout)
-        if tracked.returncode or attributes.returncode:
-            raise HubError("Could not verify GitHub checkout attributes")
-        values = attributes.stdout.split("\0")
-        if any(value not in ("unspecified", "unset") for value in values[2::3]):
-            raise HubError("Git checkout filters (including LFS) are unsupported: installed content may differ from review")
-        files, contents, warnings = _walk_static(root)
+            commit = resolved.lower()
+        tree = _github_tree(download.json(f"{api}/git/trees/{commit}?recursive=1"))
+        data = download.fetch(f"https://codeload.github.com/{repository}/tar.gz/{commit}", "application/gzip")
+        try:
+            files, contents, warnings = _inspect_github_archive(data, tree)
+        except (tarfile.TarError, OSError, EOFError) as exc:
+            raise HubError("GitHub returned an invalid archive") from exc
         manifest: dict[str, Any] = {}
         with contextlib.suppress(json.JSONDecodeError):
             parsed = json.loads(contents.get("package.json", "{}"))

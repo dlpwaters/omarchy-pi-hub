@@ -70,6 +70,7 @@ Pi Hub and Pi extensions run with your user permissions. Source review is a read
 - Package installation and updates require a source- and scope-bound review followed by confirmation. Review tokens expire after 30 minutes.
 - npm lifecycle scripts are disabled during package operations. Packages needing those scripts require deliberate manual setup. An extension can still execute arbitrary code once Pi loads it.
 - Reviews use bounded downloads and plain-text previews. A changed reviewed source is rejected before installation. The final Pi/npm download retains the normal registry trust boundary; dependencies are not exhaustively audited.
+- GitHub review uses a commit-pinned archive with no temporary checkout: 10 MB total response data, 100 MB expanded data, 500 tree entries, and a 45-second deadline. Every archived file is verified against the commit's tree. Package command output is capped at 1 MB; timeouts and limit failures terminate and reap helper processes.
 - File writes check revisions, back up previous content, and use atomic replacement. Managed-path checks restrict editor writes. Deletes use recoverable trash with **Undo delete**.
 - Package/resource toggles preserve unrelated Pi settings and original package filters. Pi Hub never updates Pi itself.
 - No telemetry or credential collection is included. npm searches send your query to npm; package review/install contacts npm, GitHub, or the package's download host. Local resource contents are not uploaded by Pi Hub.
@@ -112,7 +113,7 @@ Removal unloads the plugin and removes its installed repository. It leaves Pi, i
 - **Changes are missing in Pi:** run `/reload` in that session, and check that you selected the intended global/project scope.
 - **Folder picker or copy fails:** install `zenity` or `wl-clipboard`, respectively. A folder can be entered without the picker.
 - **The old widget remains after an update:** save drafts, then run `omarchy restart shell`.
-- **Review rejects a source:** only npm, local paths, and HTTPS GitHub repositories are supported. Other Git hosts, SSH sources, Git checkout filters (including LFS), oversized downloads, and expired or changed reviews are rejected. GitHub static review supports public repositories and ignores personal Git configuration.
+- **Review rejects a source:** only npm, local paths, and HTTPS GitHub repositories are supported. Other Git hosts, SSH sources, links/submodules in GitHub trees, Git checkout filters (including LFS), archive export rules that omit/change files, oversized downloads, and expired or changed reviews are rejected. GitHub static review supports public repositories, uses no personal credentials, and is subject to GitHub API rate limits. See SECURITY.md for exact acquisition limits.
 
 ## Development
 
