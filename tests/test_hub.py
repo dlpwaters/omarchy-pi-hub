@@ -315,44 +315,32 @@ class HubTest(unittest.TestCase):
 
     def test_github_url_resolves_to_commit_and_previews_extensionless_readme(self):
         commit = "a" * 40
-        commands = []
-        def run(argv, cwd, timeout, input_text=None):
-            commands.append(argv)
-            if "ls-remote" in argv:
-                return subprocess.CompletedProcess(argv, 0, commit + "\tHEAD\n", "")
-            if "checkout" in argv:
-                (cwd / "README").write_text("A useful README without a suffix.\n")
-            return subprocess.CompletedProcess(argv, 0, commit + "\n" if "rev-parse" in argv else "", "")
-        with mock.patch.object(hub, "_run", side_effect=run):
+        content = b"A useful README without a suffix.\n"
+        digest = hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
+        tree = {"truncated": False, "tree": [{"path": "README", "type": "blob", "mode": "100644", "size": len(content), "sha": digest}]}
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            info = tarfile.TarInfo("demo/README")
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+        responses = [commit.encode(), json.dumps(tree).encode(), buffer.getvalue()]
+        with mock.patch.object(hub, "urlopen", side_effect=lambda *a, **k: io.BytesIO(responses.pop(0))) as opened, mock.patch.object(hub, "_run") as run:
             result = hub.handle(self.request("review", source="https://github.com/example/demo"))["review"]
         self.assertEqual(result["source"], "git:https://github.com/example/demo.git@" + commit)
         self.assertIn("useful README", result["readme"])
-        self.assertTrue(any("fetch" in argv and argv[-1] == commit for argv in commands))
+        self.assertEqual(opened.call_args.args[0].full_url, "https://codeload.github.com/example/demo/tar.gz/" + commit)
+        run.assert_not_called()
         self.assertEqual(hub._parse_github("git:github.com/example/demo@Release/V1")[1], "Release/V1")
         with self.assertRaises(hub.HubError):
             hub._parse_github("https://github.com/example/demo@--upload-pack=bad")
 
-    def test_git_review_ignores_user_filters_and_rejects_filtered_sources(self):
+    def test_git_commands_ignore_user_filters(self):
         config = self.home / ".gitconfig"
         config.write_text('[filter "demo"]\n\tsmudge = must-not-run\n')
         with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "filter.demo.smudge", "GIT_CONFIG_VALUE_0": "also-must-not-run"}):
             result = hub._run(["git", "config", "--get", "filter.demo.smudge"], self.project, 5)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        commit = "b" * 40
-        def run(argv, cwd, timeout, input_text=None):
-            output = ""
-            if "rev-parse" in argv:
-                output = commit + "\n"
-            elif "ls-files" in argv:
-                output = "extensions/index.ts\0"
-            elif "check-attr" in argv:
-                self.assertEqual(input_text, "extensions/index.ts\0")
-                output = "extensions/index.ts\0filter\0lfs\0"
-            return subprocess.CompletedProcess(argv, 0, output, "")
-        with mock.patch.object(hub, "_run", side_effect=run):
-            with self.assertRaisesRegex(hub.HubError, "checkout filters"):
-                hub.handle(self.request("review", source="https://github.com/example/demo@" + commit))
 
     def test_extension_listing_uses_entrypoints_and_external_file_packages(self):
         root = self.agent / "extensions" / "demo"
